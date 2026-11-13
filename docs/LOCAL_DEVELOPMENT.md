@@ -34,18 +34,20 @@ The `/chat` request and response shapes are unchanged:
 ```bash
 curl --fail --show-error --request POST http://127.0.0.1:8000/chat \
   --header 'Content-Type: application/json' \
-  --data '{"message":"List the Pods in the lab"}'
+  --data '{"message":"List the Pods and investigate errors in their logs"}'
 ```
 
-Qwen decides whether to call `list_pods`. That tool is expected to fail safely
-outside a cluster because it requires the projected in-cluster ServiceAccount
-token. Unit tests mock both Ollama turns and the Kubernetes API, so local and CI
-validation do not require a live Ollama server or Kubernetes cluster.
+Qwen decides whether to call `list_pods` and can follow it with `get_pod_logs`.
+Log access requires an existing Pod name and is capped at 100 recent lines.
+These tools fail safely outside a cluster because they require the projected
+in-cluster ServiceAccount token. Unit tests mock Ollama turns and the Kubernetes
+API, so local and CI validation do not require live services.
 
 ## Kubernetes manifests
 
 `deploy/k3s/rbac.yaml` defines the dedicated `agent-runtime` ServiceAccount and
-a Role/RoleBinding scoped to `agentic-lab` with only the `list` verb on Pods.
+a Role/RoleBinding scoped to `agentic-lab` with `list` on Pods and `get` on the
+`pods/log` subresource.
 The Deployment keeps automatic ServiceAccount token mounting disabled and
 instead mounts a short-lived projected token and the cluster CA at the standard
 in-cluster path. Apply all resources through `deploy/k3s/kustomization.yaml`.

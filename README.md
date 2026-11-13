@@ -2,8 +2,8 @@
 
 A minimal FastAPI AI agent with tests, a non-root container image, and GitHub
 Actions checks that publish immutable images to GitHub Container Registry
-(GHCR) after pushes to `main`. The Ollama-backed agent can list Pods in the
-`agentic-lab` namespace through a single allowlisted Kubernetes tool.
+(GHCR) after pushes to `main`. The Ollama-backed agent can list Pods and inspect
+bounded recent logs in the `agentic-lab` namespace through allowlisted tools.
 
 ## Local development
 
@@ -39,5 +39,6 @@ The image includes a Docker health check and runs as an unprivileged user.
 
 See [docs/LOCAL_DEVELOPMENT.md](docs/LOCAL_DEVELOPMENT.md) for validation and
 CI/GHCR details. Kubernetes manifests under `deploy/k3s` include a dedicated
-ServiceAccount and a namespaced Role that grants only `list` on Pods; existing
-container security settings and resource requests/limits remain in place.
+ServiceAccount and a namespaced Role that grants `list` on Pods and `get` on
+the `pods/log` subresource; existing container security settings and resource
+requests/limits remain in place.

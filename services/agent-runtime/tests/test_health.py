@@ -84,7 +84,7 @@ def test_chat_returns_only_response_field(monkeypatch) -> None:
         payload = json.loads(request.content)
         assert payload["model"] == "qwen3.5:9b-16k"
         assert payload["messages"] == [{"role": "user", "content": "Hello"}]
-        assert payload["tools"] == [main.LIST_PODS_TOOL]
+        assert payload["tools"] == main.OLLAMA_TOOLS
         assert payload["stream"] is False
         return httpx.Response(
             200,
@@ -190,6 +190,164 @@ def test_model_calls_list_pods_and_summarizes_results(monkeypatch, tmp_path) -> 
         "response": "One Pod is running: agent-runtime-abc."
     }
     assert ollama_calls == 2
+
+
+def test_model_lists_pods_then_gets_bounded_logs(monkeypatch, tmp_path) -> None:
+    """Support list-to-logs investigation and return at most 100 actual lines."""
+    configure_service_account(monkeypatch, tmp_path)
+    ollama_calls = 0
+    kubernetes_calls = 0
+
+    def ollama_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ollama_calls
+        ollama_calls += 1
+        payload = json.loads(request.content)
+        if ollama_calls == 1:
+            return httpx.Response(200, json=tool_call())
+        if ollama_calls == 2:
+            list_result = json.loads(payload["messages"][2]["content"])
+            assert list_result["pods"][0]["name"] == "worker-abc"
+            return httpx.Response(
+                200,
+                json=tool_call(
+                    name="get_pod_logs",
+                    arguments={"pod_name": "worker-abc", "tail_lines": 100},
+                ),
+            )
+
+        log_result = json.loads(payload["messages"][4]["content"])
+        assert payload["messages"][4]["tool_name"] == "get_pod_logs"
+        assert log_result["namespace"] == "agentic-lab"
+        assert log_result["pod_name"] == "worker-abc"
+        assert log_result["line_count"] == 100
+        assert log_result["logs"].splitlines()[0] == "log-5"
+        assert log_result["logs"].splitlines()[-1] == "log-104"
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": "The worker logs show 100 recent lines.",
+                }
+            },
+        )
+
+    def kubernetes_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal kubernetes_calls
+        kubernetes_calls += 1
+        assert request.headers["Authorization"] == "Bearer test-token"
+        if request.url.path == "/api/v1/namespaces/agentic-lab/pods":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "worker-abc",
+                                "namespace": "agentic-lab",
+                            },
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                },
+            )
+        assert request.url.path == (
+            "/api/v1/namespaces/agentic-lab/pods/worker-abc/log"
+        )
+        assert request.url.params["tailLines"] == "100"
+        return httpx.Response(200, text="\n".join(f"log-{line}" for line in range(105)))
+
+    response = request_chat(
+        ollama_handler,
+        kubernetes_handler,
+        message="Investigate the worker Pod logs",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "response": "The worker logs show 100 recent lines."
+    }
+    assert ollama_calls == 3
+    assert kubernetes_calls == 3
+
+
+def test_get_pod_logs_rejects_missing_pod(monkeypatch, tmp_path) -> None:
+    """Do not request logs for a Pod absent from the authorized namespace."""
+    configure_service_account(monkeypatch, tmp_path)
+
+    def ollama_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=tool_call(
+                name="get_pod_logs",
+                arguments={"pod_name": "missing-pod"},
+            ),
+        )
+
+    def kubernetes_handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/api/v1/namespaces/agentic-lab/pods"
+        return httpx.Response(200, json={"items": []})
+
+    response = request_chat(ollama_handler, kubernetes_handler)
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Requested Pod is unavailable"}
+
+
+def test_get_pod_logs_handles_authorization_failure(monkeypatch, tmp_path) -> None:
+    """Hide Kubernetes details when access to the logs subresource is denied."""
+    configure_service_account(monkeypatch, tmp_path)
+
+    def ollama_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=tool_call(
+                name="get_pod_logs",
+                arguments={"pod_name": "worker-abc", "tail_lines": 20},
+            ),
+        )
+
+    def kubernetes_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/namespaces/agentic-lab/pods":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "worker-abc",
+                                "namespace": "agentic-lab",
+                            },
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(403, json={"message": "sensitive RBAC detail"})
+
+    response = request_chat(ollama_handler, kubernetes_handler)
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Kubernetes API denied the request"}
+
+
+def test_get_pod_logs_rejects_more_than_100_lines() -> None:
+    """Reject a model request that exceeds the hard log-line bound."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=tool_call(
+                name="get_pod_logs",
+                arguments={"pod_name": "worker-abc", "tail_lines": 101},
+            ),
+        )
+
+    response = request_chat(handler)
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "Model requested an unauthorized tool operation"
+    }
 
 
 def test_chat_rejects_unallowlisted_tool() -> None:
