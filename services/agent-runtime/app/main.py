@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 from collections.abc import AsyncIterator
@@ -22,6 +23,8 @@ POD_NAME_PATTERN = re.compile(
     r"(?:\.[a-z0-9](?:[-a-z0-9]*[a-z0-9])?)*$"
 )
 ALLOWED_TOOLS = frozenset({"list_pods", "get_pod_logs"})
+
+logger = logging.getLogger(__name__)
 
 LIST_PODS_TOOL = {
     "type": "function",
@@ -175,6 +178,38 @@ def kubernetes_api_url() -> str:
     return f"https://{host}:{port}"
 
 
+def is_valid_pod_name(pod_name: str) -> bool:
+    """Validate a complete Kubernetes DNS-subdomain Pod name."""
+    return (
+        0 < len(pod_name) <= 253
+        and POD_NAME_PATTERN.fullmatch(pod_name) is not None
+        and all(len(label) <= 63 for label in pod_name.split("."))
+    )
+
+
+def log_tool_execution(
+    tool_name: str,
+    arguments: dict[str, Any],
+    outcome: str,
+) -> None:
+    """Log only allowlisted tool metadata, never tool output or credentials."""
+    sanitized_arguments = (
+        {}
+        if tool_name == "list_pods"
+        else {
+            "pod_name": arguments["pod_name"],
+            "tail_lines": arguments["tail_lines"],
+        }
+    )
+    event = {
+        "event": "tool_execution",
+        "tool": tool_name,
+        "arguments": sanitized_arguments,
+        "outcome": outcome,
+    }
+    logger.info("%s", json.dumps(event, separators=(",", ":"), sort_keys=True))
+
+
 async def list_pods(client: httpx.AsyncClient) -> dict[str, Any]:
     """List a sanitized view of Pods in the one authorized namespace."""
     try:
@@ -256,10 +291,19 @@ async def get_pod_logs(
     pod_listing = await list_pods(client)
     existing_pods = {pod["name"] for pod in pod_listing["pods"]}
     if pod_name not in existing_pods:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Requested Pod is unavailable",
-        )
+        return {
+            "ok": False,
+            "error": {
+                "code": "pod_unavailable",
+                "message": (
+                    "The requested Pod is not in the current agentic-lab inventory. "
+                    "Choose an exact name from available_pods."
+                ),
+                "retryable": True,
+            },
+            "requested_pod": pod_name,
+            "available_pods": sorted(existing_pods),
+        }
 
     try:
         token = (SERVICE_ACCOUNT_DIRECTORY / "token").read_text().strip()
@@ -285,6 +329,24 @@ async def get_pod_logs(
             detail="Kubernetes API request timed out",
         ) from exc
     except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == status.HTTP_404_NOT_FOUND:
+            refreshed_listing = await list_pods(client)
+            available_pods = {
+                pod["name"] for pod in refreshed_listing["pods"]
+            }
+            return {
+                "ok": False,
+                "error": {
+                    "code": "pod_unavailable",
+                    "message": (
+                        "The requested Pod became unavailable. Choose an exact "
+                        "name from available_pods."
+                    ),
+                    "retryable": True,
+                },
+                "requested_pod": pod_name,
+                "available_pods": sorted(available_pods - {pod_name}),
+            }
         detail = (
             "Kubernetes API denied the request"
             if exc.response.status_code in {401, 403}
@@ -302,6 +364,7 @@ async def get_pod_logs(
 
     log_lines = upstream.text.splitlines()[-tail_lines:]
     return {
+        "ok": True,
         "namespace": KUBERNETES_NAMESPACE,
         "pod_name": pod_name,
         "line_count": len(log_lines),
@@ -346,8 +409,7 @@ def validated_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
             if (
                 set(arguments) - {"pod_name", "tail_lines"}
                 or not isinstance(pod_name, str)
-                or len(pod_name) > 253
-                or POD_NAME_PATTERN.fullmatch(pod_name) is None
+                or not is_valid_pod_name(pod_name)
                 or isinstance(tail_lines, bool)
                 or not isinstance(tail_lines, int)
                 or not 1 <= tail_lines <= MAX_LOG_LINES
@@ -409,14 +471,28 @@ async def chat(
         )
         for tool_call in tool_calls:
             function = tool_call["function"]
-            if function["name"] == "list_pods":
-                result = await list_pods(kubernetes_client)
-            else:
-                result = await get_pod_logs(
-                    kubernetes_client,
-                    function["arguments"]["pod_name"],
-                    function["arguments"]["tail_lines"],
+            try:
+                if function["name"] == "list_pods":
+                    result = await list_pods(kubernetes_client)
+                else:
+                    result = await get_pod_logs(
+                        kubernetes_client,
+                        function["arguments"]["pod_name"],
+                        function["arguments"]["tail_lines"],
+                    )
+            except HTTPException:
+                log_tool_execution(
+                    function["name"],
+                    function["arguments"],
+                    "failed",
                 )
+                raise
+            outcome = (
+                result["error"]["code"]
+                if result.get("ok") is False
+                else "success"
+            )
+            log_tool_execution(function["name"], function["arguments"], outcome)
             messages.append(
                 {
                     "role": "tool",

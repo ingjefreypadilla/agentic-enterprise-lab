@@ -271,32 +271,185 @@ def test_model_lists_pods_then_gets_bounded_logs(monkeypatch, tmp_path) -> None:
     assert kubernetes_calls == 3
 
 
-def test_get_pod_logs_rejects_missing_pod(monkeypatch, tmp_path) -> None:
-    """Do not request logs for a Pod absent from the authorized namespace."""
+def test_get_pod_logs_recovers_from_missing_pod(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
+    """Return a structured error so Qwen can retry with a current Pod name."""
     configure_service_account(monkeypatch, tmp_path)
+    caplog.set_level("INFO", logger=main.__name__)
+    ollama_calls = 0
 
     def ollama_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ollama_calls
+        ollama_calls += 1
+        payload = json.loads(request.content)
+        if ollama_calls == 1:
+            return httpx.Response(200, json=tool_call())
+        if ollama_calls == 2:
+            list_result = json.loads(payload["messages"][2]["content"])
+            assert list_result["pods"][0]["name"] == "worker-current"
+            return httpx.Response(
+                200,
+                json=tool_call(
+                    name="get_pod_logs",
+                    arguments={"pod_name": "missing-pod"},
+                ),
+            )
+        if ollama_calls == 3:
+            tool_result = json.loads(payload["messages"][4]["content"])
+            assert tool_result == {
+                "ok": False,
+                "error": {
+                    "code": "pod_unavailable",
+                    "message": (
+                        "The requested Pod is not in the current agentic-lab "
+                        "inventory. Choose an exact name from available_pods."
+                    ),
+                    "retryable": True,
+                },
+                "requested_pod": "missing-pod",
+                "available_pods": ["worker-current"],
+            }
+            return httpx.Response(
+                200,
+                json=tool_call(
+                    name="get_pod_logs",
+                    arguments={"pod_name": "worker-current", "tail_lines": 20},
+                ),
+            )
+        log_result = json.loads(payload["messages"][6]["content"])
+        assert log_result["ok"] is True
+        assert log_result["logs"] == "worker ready"
         return httpx.Response(
             200,
-            json=tool_call(
-                name="get_pod_logs",
-                arguments={"pod_name": "missing-pod"},
-            ),
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": "The current worker Pod is ready.",
+                }
+            },
         )
 
     def kubernetes_handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/v1/namespaces/agentic-lab/pods"
-        return httpx.Response(200, json={"items": []})
+        if request.url.path == "/api/v1/namespaces/agentic-lab/pods":
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "metadata": {
+                                "name": "worker-current",
+                                "namespace": "agentic-lab",
+                            },
+                            "status": {"phase": "Running"},
+                        }
+                    ]
+                },
+            )
+        assert request.url.path == (
+            "/api/v1/namespaces/agentic-lab/pods/worker-current/log"
+        )
+        return httpx.Response(200, text="worker ready")
 
     response = request_chat(ollama_handler, kubernetes_handler)
 
-    assert response.status_code == 502
-    assert response.json() == {"detail": "Requested Pod is unavailable"}
+    assert response.status_code == 200
+    assert response.json() == {"response": "The current worker Pod is ready."}
+    assert ollama_calls == 4
+    tool_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert '"outcome":"pod_unavailable"' in tool_logs
+    assert '"outcome":"success"' in tool_logs
+    assert '"pod_name":"missing-pod"' in tool_logs
+    assert "worker ready" not in tool_logs
+    assert "test-token" not in tool_logs
 
 
-def test_get_pod_logs_handles_authorization_failure(monkeypatch, tmp_path) -> None:
+def test_get_pod_logs_recovers_when_pod_disappears(monkeypatch, tmp_path) -> None:
+    """Refresh Pod names after a log 404 caused by rollout replacement."""
+    configure_service_account(monkeypatch, tmp_path)
+    ollama_calls = 0
+    kubernetes_calls = 0
+
+    def ollama_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal ollama_calls
+        ollama_calls += 1
+        payload = json.loads(request.content)
+        if ollama_calls == 1:
+            return httpx.Response(
+                200,
+                json=tool_call(
+                    name="get_pod_logs",
+                    arguments={"pod_name": "worker-old"},
+                ),
+            )
+        if ollama_calls == 2:
+            tool_result = json.loads(payload["messages"][2]["content"])
+            assert tool_result["error"]["code"] == "pod_unavailable"
+            assert tool_result["available_pods"] == ["worker-new"]
+            return httpx.Response(
+                200,
+                json=tool_call(
+                    name="get_pod_logs",
+                    arguments={"pod_name": "worker-new"},
+                ),
+            )
+        return httpx.Response(
+            200,
+            json={
+                "message": {
+                    "role": "assistant",
+                    "content": "The replacement worker is healthy.",
+                }
+            },
+        )
+
+    def pod_list(name: str) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "metadata": {
+                            "name": name,
+                            "namespace": "agentic-lab",
+                        },
+                        "status": {"phase": "Running"},
+                    }
+                ]
+            },
+        )
+
+    def kubernetes_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal kubernetes_calls
+        kubernetes_calls += 1
+        if kubernetes_calls == 1:
+            return pod_list("worker-old")
+        if kubernetes_calls == 2:
+            assert request.url.path.endswith("/pods/worker-old/log")
+            return httpx.Response(404, json={"message": "gone"})
+        if kubernetes_calls in {3, 4}:
+            return pod_list("worker-new")
+        assert request.url.path.endswith("/pods/worker-new/log")
+        return httpx.Response(200, text="healthy")
+
+    response = request_chat(ollama_handler, kubernetes_handler)
+
+    assert response.status_code == 200
+    assert response.json() == {"response": "The replacement worker is healthy."}
+    assert ollama_calls == 3
+    assert kubernetes_calls == 5
+
+
+def test_get_pod_logs_handles_authorization_failure(
+    monkeypatch,
+    tmp_path,
+    caplog,
+) -> None:
     """Hide Kubernetes details when access to the logs subresource is denied."""
     configure_service_account(monkeypatch, tmp_path)
+    caplog.set_level("INFO", logger=main.__name__)
 
     def ollama_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -329,6 +482,30 @@ def test_get_pod_logs_handles_authorization_failure(monkeypatch, tmp_path) -> No
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Kubernetes API denied the request"}
+    tool_logs = "\n".join(record.getMessage() for record in caplog.records)
+    assert '"outcome":"failed"' in tool_logs
+    assert "sensitive RBAC detail" not in tool_logs
+
+
+def test_get_pod_logs_rejects_invalid_dns_label() -> None:
+    """Reject Pod names with DNS labels longer than Kubernetes permits."""
+    invalid_name = f"{'a' * 64}.worker"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=tool_call(
+                name="get_pod_logs",
+                arguments={"pod_name": invalid_name},
+            ),
+        )
+
+    response = request_chat(handler)
+
+    assert response.status_code == 502
+    assert response.json() == {
+        "detail": "Model requested an unauthorized tool operation"
+    }
 
 
 def test_get_pod_logs_rejects_more_than_100_lines() -> None:

@@ -33,6 +33,12 @@ to three tool calls and Kubernetes requests use a five-second timeout. Ollama
 requests retain their existing 120-second timeout. Upstream error bodies are not
 returned to callers.
 
+If a selected Pod is stale or disappears during a rollout, the tool returns a
+structured, retryable error with the current Pod names so Qwen can recover
+within the existing tool-call limit. Tool execution logs contain only the tool
+name, validated arguments, and outcome; credentials, Pod logs, user messages,
+and upstream error bodies are never logged.
+
 Outside Kubernetes, ordinary chat responses still work. A locally requested
 Kubernetes tool call fails safely because no in-cluster ServiceAccount token
 exists.
