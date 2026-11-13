@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import re
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Annotated, Any
@@ -25,6 +26,26 @@ POD_NAME_PATTERN = re.compile(
 ALLOWED_TOOLS = frozenset({"list_pods", "get_pod_logs"})
 
 logger = logging.getLogger(__name__)
+
+
+def configure_application_logger() -> None:
+    """Emit application INFO events once as JSON lines on stdout."""
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if any(
+        getattr(handler, "_agent_runtime_stdout", False)
+        for handler in logger.handlers
+    ):
+        return
+
+    handler = logging.StreamHandler(sys.__stdout__)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler._agent_runtime_stdout = True
+    logger.addHandler(handler)
+
+
+configure_application_logger()
 
 LIST_PODS_TOOL = {
     "type": "function",

@@ -274,11 +274,10 @@ def test_model_lists_pods_then_gets_bounded_logs(monkeypatch, tmp_path) -> None:
 def test_get_pod_logs_recovers_from_missing_pod(
     monkeypatch,
     tmp_path,
-    caplog,
+    capfd,
 ) -> None:
     """Return a structured error so Qwen can retry with a current Pod name."""
     configure_service_account(monkeypatch, tmp_path)
-    caplog.set_level("INFO", logger=main.__name__)
     ollama_calls = 0
 
     def ollama_handler(request: httpx.Request) -> httpx.Response:
@@ -358,7 +357,7 @@ def test_get_pod_logs_recovers_from_missing_pod(
     assert response.status_code == 200
     assert response.json() == {"response": "The current worker Pod is ready."}
     assert ollama_calls == 4
-    tool_logs = "\n".join(record.getMessage() for record in caplog.records)
+    tool_logs = capfd.readouterr().out
     assert '"outcome":"pod_unavailable"' in tool_logs
     assert '"outcome":"success"' in tool_logs
     assert '"pod_name":"missing-pod"' in tool_logs
@@ -445,11 +444,10 @@ def test_get_pod_logs_recovers_when_pod_disappears(monkeypatch, tmp_path) -> Non
 def test_get_pod_logs_handles_authorization_failure(
     monkeypatch,
     tmp_path,
-    caplog,
+    capfd,
 ) -> None:
     """Hide Kubernetes details when access to the logs subresource is denied."""
     configure_service_account(monkeypatch, tmp_path)
-    caplog.set_level("INFO", logger=main.__name__)
 
     def ollama_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -482,9 +480,40 @@ def test_get_pod_logs_handles_authorization_failure(
 
     assert response.status_code == 502
     assert response.json() == {"detail": "Kubernetes API denied the request"}
-    tool_logs = "\n".join(record.getMessage() for record in caplog.records)
+    tool_logs = capfd.readouterr().out
     assert '"outcome":"failed"' in tool_logs
     assert "sensitive RBAC detail" not in tool_logs
+
+
+def test_tool_logger_emits_one_structured_event_to_stdout(capfd) -> None:
+    """Keep INFO tool events visible under Uvicorn without duplicate handlers."""
+    main.configure_application_logger()
+    main.configure_application_logger()
+
+    stdout_handlers = [
+        handler
+        for handler in main.logger.handlers
+        if getattr(handler, "_agent_runtime_stdout", False)
+    ]
+    assert main.logger.level == main.logging.INFO
+    assert main.logger.propagate is False
+    assert len(stdout_handlers) == 1
+    assert stdout_handlers[0].stream.fileno() == 1
+
+    main.log_tool_execution(
+        "get_pod_logs",
+        {"pod_name": "worker-abc", "tail_lines": 20},
+        "success",
+    )
+
+    lines = capfd.readouterr().out.splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == {
+        "event": "tool_execution",
+        "tool": "get_pod_logs",
+        "arguments": {"pod_name": "worker-abc", "tail_lines": 20},
+        "outcome": "success",
+    }
 
 
 def test_get_pod_logs_rejects_invalid_dns_label() -> None:
