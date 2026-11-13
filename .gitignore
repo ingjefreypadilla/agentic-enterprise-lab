@@ -151,6 +151,9 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
+!.env.*.example
 .envrc
 .venv
 env/
@@ -158,6 +161,26 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Credentials and infrastructure state
+.aws/
+.kube/
+kubeconfig
+kubeconfig.*
+credentials.json
+service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
 
 # Spyder project settings
 .spyderproject

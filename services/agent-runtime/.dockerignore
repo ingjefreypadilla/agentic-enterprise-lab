@@ -7,3 +7,19 @@ __pycache__
 *.egg-info
 Dockerfile*
 tests
+
+# Never send local secrets or infrastructure state to the build daemon.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+service-account*.json
+kubeconfig
+kubeconfig.*
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
