@@ -10,7 +10,7 @@ agentic-enterprise-lab/
 │   └── README.md
 ├── services/                      # Agent runtime services
 │   └── agent-runtime/             # Minimal FastAPI service
-├── github/                        # CI/CD workflows
+├── .github/                       # CI/CD workflows
 │   └── workflows/
 ├── docs/                          # Project documentation
 └── README.md
@@ -21,5 +21,5 @@ agentic-enterprise-lab/
 - **Single responsibility**: Each service has one clear purpose
 - **Immutable tags**: Images tagged with git commit SHA for reproducibility
 - **Least privilege**: No privileged containers, minimal permissions
-- **No external dependencies**: Pure Python FastAPI, no AI frameworks yet
+- **Minimal dependencies**: FastAPI and Uvicorn, with no AI framework yet
 - **Test first**: All services have pytest tests before deployment

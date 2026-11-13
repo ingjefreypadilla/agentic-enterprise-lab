@@ -1,44 +1,33 @@
-# Stage 1: Builder stage
-FROM python:3.12-slim AS builder
+FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS builder
 
 WORKDIR /build
 
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc \
-    libpq-dev && \
-    rm -rf /var/lib/apt/lists/*
+COPY pyproject.toml requirements.lock README.md ./
+COPY app ./app
+RUN pip wheel --no-cache-dir --constraint requirements.lock --wheel-dir /wheels .
 
-# Copy and install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+FROM python:3.12-slim-trixie@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b AS runtime
 
-# Stage 2: Runtime stage
-FROM python:3.12-slim AS runtime
-
-# Create non-root user for security
-RUN groupadd --gid 1000 appgroup && \
-    useradd --uid 1000 --gid appgroup --no-create-home --shell /bin/bash appuser
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Copy installed dependencies from builder
-COPY --from=builder /build/lib /usr/local/lib
+COPY --from=builder /wheels /wheels
+RUN apt-get update && \
+    apt-get install --only-upgrade --yes --no-install-recommends zlib1g && \
+    rm -rf /var/lib/apt/lists/* && \
+    pip install --no-cache-dir /wheels/* && \
+    python -m pip uninstall --yes pip setuptools && \
+    rm -rf /wheels && \
+    groupadd --system app && \
+    useradd --system --gid app --no-create-home app
 
-# Set ownership to non-root user
-RUN chown -R appuser:apppgroup /app && \
-    chmod -R 644 /app
+USER app
 
-USER appuser
+EXPOSE 8000
 
-# Expose the service port (FastAPI default)
-ENV PORT=8000
-EXPOSE ${PORT}
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
 
-# Create health check directory
-RUN mkdir -p /app/health_checks && \
-    chmod 755 /app/health_checks
-
-# Run the FastAPI application
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "${PORT}"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
