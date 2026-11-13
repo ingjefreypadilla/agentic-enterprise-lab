@@ -29,6 +29,27 @@ curl --fail --show-error http://127.0.0.1:8000/health
 
 The expected response is `{"status":"healthy"}`.
 
+The `/chat` request and response shapes are unchanged:
+
+```bash
+curl --fail --show-error --request POST http://127.0.0.1:8000/chat \
+  --header 'Content-Type: application/json' \
+  --data '{"message":"List the Pods in the lab"}'
+```
+
+Qwen decides whether to call `list_pods`. That tool is expected to fail safely
+outside a cluster because it requires the projected in-cluster ServiceAccount
+token. Unit tests mock both Ollama turns and the Kubernetes API, so local and CI
+validation do not require a live Ollama server or Kubernetes cluster.
+
+## Kubernetes manifests
+
+`deploy/k3s/rbac.yaml` defines the dedicated `agent-runtime` ServiceAccount and
+a Role/RoleBinding scoped to `agentic-lab` with only the `list` verb on Pods.
+The Deployment keeps automatic ServiceAccount token mounting disabled and
+instead mounts a short-lived projected token and the cluster CA at the standard
+in-cluster path. Apply all resources through `deploy/k3s/kustomization.yaml`.
+
 ## Build and test the image
 
 ```bash

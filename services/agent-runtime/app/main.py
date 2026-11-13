@@ -1,6 +1,8 @@
+import json
 import os
 from collections.abc import AsyncIterator
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Any
 
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, status
@@ -9,11 +11,30 @@ from pydantic import BaseModel, Field
 DEFAULT_OLLAMA_BASE_URL = "http://192.168.1.73:11434"
 DEFAULT_OLLAMA_MODEL = "qwen3.5:9b-16k"
 OLLAMA_TIMEOUT = httpx.Timeout(120.0, connect=5.0)
+KUBERNETES_TIMEOUT = httpx.Timeout(5.0, connect=2.0)
+KUBERNETES_NAMESPACE = "agentic-lab"
+SERVICE_ACCOUNT_DIRECTORY = Path("/var/run/secrets/kubernetes.io/serviceaccount")
+MAX_TOOL_CALLS = 3
+ALLOWED_TOOLS = frozenset({"list_pods"})
+
+LIST_PODS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_pods",
+        "description": "List Pods in the agentic-lab Kubernetes namespace.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+}
 
 app = FastAPI(
     title="Agent Runtime Service",
     description="A minimal Ollama-backed chat service for the Agentic Enterprise Lab",
-    version="0.1.0",
+    version="0.2.0",
 )
 
 
@@ -35,7 +56,16 @@ async def get_ollama_client() -> AsyncIterator[httpx.AsyncClient]:
         yield client
 
 
+async def get_kubernetes_client() -> AsyncIterator[httpx.AsyncClient]:
+    """Provide a short-lived client that trusts the in-cluster Kubernetes CA."""
+    ca_path = SERVICE_ACCOUNT_DIRECTORY / "ca.crt"
+    verify: bool | str = str(ca_path) if ca_path.is_file() else True
+    async with httpx.AsyncClient(timeout=KUBERNETES_TIMEOUT, verify=verify) as client:
+        yield client
+
+
 OllamaClient = Annotated[httpx.AsyncClient, Depends(get_ollama_client)]
+KubernetesClient = Annotated[httpx.AsyncClient, Depends(get_kubernetes_client)]
 
 
 @app.get("/health")
@@ -44,19 +74,28 @@ def health_check() -> dict:
     return {"status": "healthy"}
 
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(
-    request: ChatRequest,
-    client: OllamaClient,
-) -> ChatResponse:
-    """Generate a response using the configured Ollama model."""
+def ollama_configuration() -> tuple[str, str]:
+    """Return the configured Ollama endpoint and model."""
     base_url = os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL).rstrip("/")
     model = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+    return base_url, model
 
+
+async def request_ollama(
+    client: httpx.AsyncClient,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Send one tool-aware chat turn to Ollama and validate its envelope."""
+    base_url, model = ollama_configuration()
     try:
         upstream = await client.post(
-            f"{base_url}/api/generate",
-            json={"model": model, "prompt": request.message, "stream": False},
+            f"{base_url}/api/chat",
+            json={
+                "model": model,
+                "messages": messages,
+                "tools": [LIST_PODS_TOOL],
+                "stream": False,
+            },
         )
         upstream.raise_for_status()
     except httpx.TimeoutException as exc:
@@ -78,11 +117,169 @@ async def chat(
             detail="Ollama returned an invalid response",
         ) from exc
 
-    response = payload.get("response") if isinstance(payload, dict) else None
-    if not isinstance(response, str):
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, dict):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Ollama returned an invalid response",
+        )
+    return message
+
+
+def kubernetes_api_url() -> str:
+    """Build the in-cluster API URL without allowing a namespace override."""
+    host = os.getenv("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    port = os.getenv("KUBERNETES_SERVICE_PORT_HTTPS", "443")
+    return f"https://{host}:{port}"
+
+
+async def list_pods(client: httpx.AsyncClient) -> dict[str, Any]:
+    """List a sanitized view of Pods in the one authorized namespace."""
+    try:
+        token = (SERVICE_ACCOUNT_DIRECTORY / "token").read_text().strip()
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Kubernetes service account is unavailable",
+        ) from exc
+
+    try:
+        upstream = await client.get(
+            f"{kubernetes_api_url()}/api/v1/namespaces/{KUBERNETES_NAMESPACE}/pods",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        upstream.raise_for_status()
+    except httpx.TimeoutException as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="Kubernetes API request timed out",
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        detail = (
+            "Kubernetes API denied the request"
+            if exc.response.status_code in {401, 403}
+            else "Kubernetes API request failed"
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=detail,
+        ) from exc
+    except httpx.RequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Kubernetes API request failed",
+        ) from exc
+
+    try:
+        payload = upstream.json()
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Kubernetes API returned an invalid response",
+        ) from exc
+
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Kubernetes API returned an invalid response",
+        )
+
+    pods = []
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        pod_status = item.get("status") if isinstance(item, dict) else None
+        name = metadata.get("name") if isinstance(metadata, dict) else None
+        namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
+        phase = pod_status.get("phase") if isinstance(pod_status, dict) else None
+        if (
+            not isinstance(name, str)
+            or namespace != KUBERNETES_NAMESPACE
+            or not isinstance(phase, str)
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Kubernetes API returned an invalid response",
+            )
+        pods.append({"name": name, "namespace": namespace, "phase": phase})
+    return {"namespace": KUBERNETES_NAMESPACE, "count": len(pods), "pods": pods}
+
+
+def validated_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Validate model-selected calls against the strict server-side allowlist."""
+    tool_calls = message.get("tool_calls", [])
+    if not isinstance(tool_calls, list):
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="Ollama returned an invalid response",
         )
 
-    return ChatResponse(response=response)
+    validated = []
+    for tool_call in tool_calls:
+        function = tool_call.get("function") if isinstance(tool_call, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        arguments = function.get("arguments", {}) if isinstance(function, dict) else None
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = None
+        if name not in ALLOWED_TOOLS or arguments != {}:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Model requested an unauthorized tool operation",
+            )
+        validated.append({"function": {"name": name, "arguments": {}}})
+    return validated
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    ollama_client: OllamaClient,
+    kubernetes_client: KubernetesClient,
+) -> ChatResponse:
+    """Let Ollama select an allowed tool and summarize its actual output."""
+    messages: list[dict[str, Any]] = [{"role": "user", "content": request.message}]
+    tool_call_count = 0
+
+    while True:
+        assistant_message = await request_ollama(ollama_client, messages)
+        tool_calls = validated_tool_calls(assistant_message)
+        if not tool_calls:
+            content = assistant_message.get("content")
+            if not isinstance(content, str):
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail="Ollama returned an invalid response",
+                )
+            return ChatResponse(response=content)
+
+        if tool_call_count + len(tool_calls) > MAX_TOOL_CALLS:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Model exceeded the tool-call limit",
+            )
+        tool_call_count += len(tool_calls)
+        assistant_content = assistant_message.get("content", "")
+        if not isinstance(assistant_content, str):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="Ollama returned an invalid response",
+            )
+        messages.append(
+            {
+                "role": "assistant",
+                "content": assistant_content,
+                "tool_calls": tool_calls,
+            }
+        )
+        for tool_call in tool_calls:
+            result = await list_pods(kubernetes_client)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_name": tool_call["function"]["name"],
+                    "content": json.dumps(result, separators=(",", ":")),
+                }
+            )

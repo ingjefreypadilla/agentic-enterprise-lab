@@ -21,6 +21,7 @@ spec:
         app.kubernetes.io/part-of: agentic-enterprise-lab
     spec:
       automountServiceAccountToken: false
+      serviceAccountName: agent-runtime
       nodeSelector:
         kubernetes.io/arch: amd64
       securityContext:
@@ -73,3 +74,20 @@ spec:
             capabilities:
               drop:
                 - ALL
+          volumeMounts:
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
+      volumes:
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
