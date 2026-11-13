@@ -45,12 +45,26 @@ API, so local and CI validation do not require live services.
 
 ## Kubernetes manifests
 
-`deploy/k3s/rbac.yaml` defines the dedicated `agent-runtime` ServiceAccount and
-a Role/RoleBinding scoped to `agentic-lab` with `list` on Pods and `get` on the
-`pods/log` subresource.
+`deploy/k3s-security/rbac.yaml` defines the dedicated `agent-runtime`
+ServiceAccount and a Role/RoleBinding scoped to `agentic-lab` with `list` on
+Pods and `get` on the `pods/log` subresource. A cluster administrator applies
+these security resources:
+
+```bash
+kubectl apply -k deploy/k3s-security/
+```
+
+The restricted `codex-deployer` account applies only the Deployment and
+Service:
+
+```bash
+kubectl apply -k deploy/k3s/
+```
+
 The Deployment keeps automatic ServiceAccount token mounting disabled and
 instead mounts a short-lived projected token and the cluster CA at the standard
-in-cluster path. Apply all resources through `deploy/k3s/kustomization.yaml`.
+in-cluster path. Apply the security configuration before the application on a
+new cluster.
 
 ## Build and test the image
 
