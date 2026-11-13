@@ -9,8 +9,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
+    if: github.event_name == 'pull_request' || !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
 
     steps:
@@ -45,10 +50,10 @@ jobs:
   publish:
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
 
     permissions:
-      contents: read
+      contents: write
       packages: write
 
     steps:
@@ -85,3 +90,63 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Check out latest main for manifest update
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Update Kubernetes image
+        id: manifest
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/agent-runtime:sha-${{ github.sha }}
+        run: |
+          manifest_path=deploy/k3s/deployment.yaml
+
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" HEAD; then
+            echo "A rewritten main branch superseded this run; skipping the manifest update."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git diff --quiet "$GITHUB_SHA..HEAD" -- . \
+            ':(exclude)deploy/k3s/deployment.yaml'; then
+            echo "A newer source commit superseded this run; its workflow will update the manifest."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          test "$(grep -c '^[[:space:]]*image:' "$manifest_path")" -eq 1
+          awk -v image="$IMAGE" '
+            /^[[:space:]]*image: .*agent-runtime:sha-[0-9a-f]{40}$/ {
+              sub(/image:.*/, "image: " image)
+              replacements++
+            }
+            { print }
+            END { if (replacements != 1) exit 1 }
+          ' "$manifest_path" > "${manifest_path}.tmp"
+          mv "${manifest_path}.tmp" "$manifest_path"
+          grep -Fqx "          image: ${IMAGE}" "$manifest_path"
+
+          if git diff --quiet -- "$manifest_path"; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push Kubernetes image update
+        if: steps.manifest.outputs.changed == 'true'
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add deploy/k3s/deployment.yaml
+          git commit -m "chore: update Agent Runtime image to sha-${GITHUB_SHA} [skip ci]"
+
+          if ! git push origin "HEAD:${BRANCH}"; then
+            echo "::error::${BRANCH} advanced during the update; refusing to overwrite it."
+            exit 1
+          fi
