@@ -33,6 +33,11 @@ spec:
         - name: agent-runtime
           image: ghcr.io/ingjefreypadilla/agentic-enterprise-lab/agent-runtime:sha-37d4bf21f5ce6c78d02ca0ef429775fb88d29fa6
           imagePullPolicy: IfNotPresent
+          env:
+            - name: OLLAMA_BASE_URL
+              value: http://192.168.1.73:11434
+            - name: OLLAMA_MODEL
+              value: qwen3.5:9b-16k
           ports:
             - name: http
               containerPort: 8000
