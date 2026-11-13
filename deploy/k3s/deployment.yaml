@@ -31,7 +31,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: agent-runtime
-          image: ghcr.io/ingjefreypadilla/agentic-enterprise-lab/agent-runtime:sha-37d4bf21f5ce6c78d02ca0ef429775fb88d29fa6
+          image: ghcr.io/ingjefreypadilla/agentic-enterprise-lab/agent-runtime:sha-29ea6e86e28a88f7444788b23a831e36c745fac2
           imagePullPolicy: IfNotPresent
           env:
             - name: OLLAMA_BASE_URL
