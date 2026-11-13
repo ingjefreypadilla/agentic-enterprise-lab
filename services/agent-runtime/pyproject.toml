@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-runtime"
+version = "0.1.0"
+description = "A minimal FastAPI health check service for the Agentic Enterprise Lab"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0,<1.0.0",
+]
+
+[project.scripts]
+agent-runtime = "app.main:run()"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.4.0,<8.0.0",
+    "pytest-cov>=4.1.0,<5.0.0",
+]
